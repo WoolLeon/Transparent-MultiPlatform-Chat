@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+/publish/
+/installer/Output/
+**/*.user
+**/*.suo
+**/settings.json
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets.json
+*.log
+*.pfx
+*.key
+*.pem

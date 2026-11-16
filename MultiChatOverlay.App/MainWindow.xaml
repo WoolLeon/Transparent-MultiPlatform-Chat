@@ -1,0 +1,88 @@
+<Window x:Class="MultiChatOverlay.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        xmlns:primitives="clr-namespace:System.Windows.Controls.Primitives;assembly=PresentationFramework"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="Multi Chat Overlay"
+        Width="420" Height="760" MinWidth="250" MinHeight="220"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="CanResize"
+        Loaded="Window_Loaded" Closing="Window_Closing">
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="0" ResizeBorderThickness="7"
+                            GlassFrameThickness="0" UseAeroCaptionButtons="False"/>
+    </shell:WindowChrome.WindowChrome>
+    <Border x:Name="OverlayFrame" BorderBrush="#BFFFFFFF" BorderThickness="3"
+            Background="Transparent" ClipToBounds="True">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition x:Name="ToolbarRow" Height="42"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Border x:Name="Toolbar" Grid.Row="0" Background="#E6000000"
+                    MouseLeftButtonDown="Toolbar_MouseLeftButtonDown">
+                <Border.ContextMenu>
+                    <ContextMenu x:Name="OverlayContextMenu">
+                        <MenuItem Header="Toggle Interactable (click-through)" Click="Lock_Click"
+                                  InputGestureText="Ctrl+Shift+L"/>
+                        <Separator/>
+                        <MenuItem Header="Zoom Level">
+                            <MenuItem Header="75%" Tag="0.75" Click="SetZoom_Click"/>
+                            <MenuItem Header="90%" Tag="0.9" Click="SetZoom_Click"/>
+                            <MenuItem Header="100%" Tag="1" Click="SetZoom_Click"/>
+                            <MenuItem Header="110%" Tag="1.1" Click="SetZoom_Click"/>
+                            <MenuItem Header="125%" Tag="1.25" Click="SetZoom_Click"/>
+                        </MenuItem>
+                        <MenuItem Header="Opacity Level">
+                            <MenuItem Header="Increase opacity" Click="IncreaseOpacity_Click"/>
+                            <MenuItem Header="Decrease opacity" Click="DecreaseOpacity_Click"/>
+                            <MenuItem Header="Reset opacity" Click="ResetOpacity_Click"/>
+                        </MenuItem>
+                        <Separator/>
+                        <MenuItem Header="Clear Chat" Click="ClearChat_Click"
+                                  InputGestureText="Ctrl+Shift+C"/>
+                        <MenuItem Header="Settings" Click="Settings_Click"/>
+                        <MenuItem Header="Bring to Top" Click="BringToTop_Click"/>
+                        <Separator/>
+                        <MenuItem Header="Hide overlay" Click="Hide_Click"
+                                  InputGestureText="Ctrl+Shift+O"/>
+                    </ContextMenu>
+                </Border.ContextMenu>
+                <DockPanel Margin="4,0">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" DockPanel.Dock="Left">
+                        <Button x:Name="MainMenuButton" Content="☰" Width="34" Height="34" Padding="0"
+                                Background="Transparent" Foreground="White" BorderThickness="0"
+                                Click="MainMenu_Click" ToolTip="Overlay menu"/>
+                        <TextBlock Text="MULTI CHAT" Foreground="#E6EDF7" FontWeight="Bold"
+                                   FontSize="11" VerticalAlignment="Center" Margin="5,0,0,0"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" DockPanel.Dock="Right">
+                        <TextBlock x:Name="TwitchStatus" Text="● TW" Foreground="#8792A2"
+                                   Margin="5,0,3,0" VerticalAlignment="Center" FontSize="10"/>
+                        <TextBlock x:Name="YouTubeStatus" Text="● YT" Foreground="#8792A2"
+                                   Margin="3,0,3,0" VerticalAlignment="Center" FontSize="10"/>
+                        <TextBlock x:Name="KickStatus" Text="● KI" Foreground="#8792A2"
+                                   Margin="3,0,3,0" VerticalAlignment="Center" FontSize="10"/>
+                        <TextBlock x:Name="FacebookStatus" Text="● FB" Foreground="#8792A2"
+                                   Margin="3,0,3,0" VerticalAlignment="Center" FontSize="10"/>
+                        <TextBlock x:Name="StreamerBotStatus" Text="● SB" Foreground="#8792A2"
+                                   Margin="3,0,4,0" VerticalAlignment="Center" FontSize="10"/>
+                        <Button x:Name="LockButton" Content="◉" Width="30" Height="34" Padding="0"
+                                Background="Transparent" Foreground="White" BorderThickness="0"
+                                Click="Lock_Click" ToolTip="Lock overlay (Ctrl+Shift+L)"/>
+                        <Button Content="×" Width="30" Height="34" Padding="0" Background="Transparent"
+                                Foreground="White" BorderThickness="0" Click="Hide_Click" ToolTip="Hide overlay"/>
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+            <Border Grid.Row="1" Background="Transparent">
+                <wv2:WebView2 x:Name="ChatView" DefaultBackgroundColor="Transparent"/>
+            </Border>
+            <primitives:Thumb x:Name="ResizeGrip" Grid.Row="1" Width="22" Height="22"
+                              HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                              Cursor="SizeNWSE" DragDelta="ResizeGrip_DragDelta"
+                              Background="#AAFFFFFF" Opacity="0.35"/>
+        </Grid>
+    </Border>
+</Window>
