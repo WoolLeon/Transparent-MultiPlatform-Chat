@@ -1,12 +1,13 @@
 using System.Windows;
 using System.Runtime.InteropServices;
+using System.Threading;
 using MultiChatOverlay.App.Logging;
 
 namespace MultiChatOverlay.App;
 
 public partial class App : System.Windows.Application
 {
-    private const string SingleInstanceMutexName = @"Local\MultiChatOverlay.SingleInstance";
+    private const string SingleInstanceMutexName = @"Local\MultiChatOverlay.SingleInstance.v2";
     private const int WmShowOverlay = 0x8000 + 0x351;
     private const int SwShowNoActivate = 8;
     private Mutex? _singleInstanceMutex;
@@ -15,7 +16,20 @@ public partial class App : System.Windows.Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
-        _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out _ownsSingleInstanceMutex);
+
+        // Force logger initialization early
+        _ = Log.Logger;
+
+        try
+        {
+            _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out _ownsSingleInstanceMutex);
+        }
+        catch (AbandonedMutexException)
+        {
+            // Previous instance crashed - we now own the mutex
+            _ownsSingleInstanceMutex = true;
+        }
+
         if (!_ownsSingleInstanceMutex)
         {
             var existingWindow = FindWindow(null, "Multi Chat Overlay");
@@ -42,8 +56,11 @@ public partial class App : System.Windows.Application
                 Log.Logger.Fatal(exception, "Unhandled process exception");
         };
 
+        Log.Logger.Information("Application starting up");
         MainWindow = new MainWindow();
+        Log.Logger.Information("MainWindow created, showing");
         MainWindow.Show();
+        Log.Logger.Information("MainWindow shown");
     }
 
     protected override void OnExit(ExitEventArgs e)

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.WebSockets;
 using System.Text;
 using MultiChatOverlay.Core.Models;
@@ -13,12 +14,15 @@ public sealed class TwitchIrcSource(string channel, string username, string acce
     private CancellationTokenSource? _lifetime;
     private Task? _runTask;
     private ConnectionState _state = ConnectionState.Disconnected;
+    private ConnectionHealth _health = ConnectionHealth.Unhealthy(DateTimeOffset.MinValue, 0);
 
     public ChatPlatform Platform => ChatPlatform.Twitch;
     public ConnectionState State => _state;
+    public ConnectionHealth Health => _health;
     public event Action<ChatItem>? ItemReceived;
     public event Action<ConnectionState>? StateChanged;
     public event Action<Exception>? ErrorOccurred;
+    public event Action<ConnectionHealth>? HealthChanged;
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -55,6 +59,11 @@ public sealed class TwitchIrcSource(string channel, string username, string acce
 
     public async ValueTask DisposeAsync() => await StopAsync();
 
+    public void SetPollInterval(TimeSpan interval)
+    {
+        // Twitch IRC uses WebSocket, not polling - no-op
+    }
+
     private async Task RunAsync(CancellationToken cancellationToken)
     {
         var retry = TimeSpan.FromSeconds(1);
@@ -66,12 +75,18 @@ public sealed class TwitchIrcSource(string channel, string username, string acce
             {
                 SetState(firstAttempt ? ConnectionState.Connecting : ConnectionState.Reconnecting);
                 firstAttempt = false;
+                var connectStart = DateTimeOffset.UtcNow;
                 await socket.ConnectAsync(new Uri("wss://irc-ws.chat.twitch.tv:443"), cancellationToken);
+                var connectLatency = DateTimeOffset.UtcNow - connectStart;
+
                 await SendAsync(socket, $"PASS oauth:{_accessToken}\r\n", cancellationToken);
                 await SendAsync(socket, $"NICK {_username}\r\n", cancellationToken);
                 await SendAsync(socket, "CAP REQ :twitch.tv/tags twitch.tv/commands\r\n", cancellationToken);
                 await SendAsync(socket, $"JOIN #{_channel}\r\n", cancellationToken);
+
+                SetHealth(ConnectionHealth.Healthy(DateTimeOffset.UtcNow, connectLatency));
                 await ReceiveLoopAsync(socket, cancellationToken);
+
                 if (_state == ConnectionState.Connected)
                     retry = TimeSpan.FromSeconds(1);
                 if (!cancellationToken.IsCancellationRequested)
@@ -80,6 +95,7 @@ public sealed class TwitchIrcSource(string channel, string username, string acce
             catch (TwitchAuthenticationException ex)
             {
                 ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
                 SetState(ConnectionState.Faulted);
                 break;
             }
@@ -90,6 +106,7 @@ public sealed class TwitchIrcSource(string channel, string username, string acce
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
                 SetState(ConnectionState.Reconnecting);
             }
 
@@ -103,39 +120,46 @@ public sealed class TwitchIrcSource(string channel, string username, string acce
 
     private async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken cancellationToken)
     {
-        var buffer = new byte[8192];
+        var buffer = ArrayPool<byte>.Shared.Rent(8192);
         var pending = new StringBuilder();
-        while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
+        try
         {
-            var result = await socket.ReceiveAsync(buffer, cancellationToken);
-            if (result.MessageType == WebSocketMessageType.Close)
-                return;
-
-            pending.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
-            while (true)
+            while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
             {
-                var content = pending.ToString();
-                var lineEnd = content.IndexOf('\n');
-                if (lineEnd < 0)
-                    break;
+                var result = await socket.ReceiveAsync(buffer, cancellationToken);
+                if (result.MessageType == WebSocketMessageType.Close)
+                    return;
 
-                var line = content[..lineEnd].TrimEnd('\r');
-                pending.Clear().Append(content[(lineEnd + 1)..]);
-                if (line.StartsWith("PING ", StringComparison.Ordinal))
+                pending.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                while (true)
                 {
-                    await SendAsync(socket, $"PONG {line[5..]}\r\n", cancellationToken);
-                    continue;
+                    var content = pending.ToString();
+                    var lineEnd = content.IndexOf('\n');
+                    if (lineEnd < 0)
+                        break;
+
+                    var line = content[..lineEnd].TrimEnd('\r');
+                    pending.Clear().Append(content[(lineEnd + 1)..]);
+                    if (line.StartsWith("PING ", StringComparison.Ordinal))
+                    {
+                        await SendAsync(socket, $"PONG {line[5..]}\r\n", cancellationToken);
+                        continue;
+                    }
+
+                    if (line.StartsWith(":tmi.twitch.tv 001 ", StringComparison.Ordinal))
+                        SetState(ConnectionState.Connected);
+                    if (TwitchIrcParser.IsAuthenticationFailureNotice(line))
+                        throw new TwitchAuthenticationException(
+                            "Twitch rejected the saved access token. Sign in to Twitch again in Settings.");
+
+                    foreach (var item in TwitchIrcParser.ParseItems(line))
+                        ItemReceived?.Invoke(item);
                 }
-
-                if (line.StartsWith(":tmi.twitch.tv 001 ", StringComparison.Ordinal))
-                    SetState(ConnectionState.Connected);
-                if (TwitchIrcParser.IsAuthenticationFailureNotice(line))
-                    throw new TwitchAuthenticationException(
-                        "Twitch rejected the saved access token. Sign in to Twitch again in Settings.");
-
-                foreach (var item in TwitchIrcParser.ParseItems(line))
-                    ItemReceived?.Invoke(item);
             }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -146,6 +170,12 @@ public sealed class TwitchIrcSource(string channel, string username, string acce
     {
         _state = state;
         StateChanged?.Invoke(state);
+    }
+
+    private void SetHealth(ConnectionHealth health)
+    {
+        _health = health;
+        HealthChanged?.Invoke(health);
     }
 
     private static string NormalizeChannel(string channel)

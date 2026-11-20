@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -13,12 +14,15 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
     private Task? _runTask;
     private ClientWebSocket? _activeSocket;
     private ConnectionState _state = ConnectionState.Disconnected;
+    private ConnectionHealth _health = ConnectionHealth.Unhealthy(DateTimeOffset.MinValue, 0);
 
     public ChatPlatform Platform => ChatPlatform.StreamerBot;
     public ConnectionState State => _state;
+    public ConnectionHealth Health => _health;
     public event Action<ChatItem>? ItemReceived;
     public event Action<ConnectionState>? StateChanged;
     public event Action<Exception>? ErrorOccurred;
+    public event Action<ConnectionHealth>? HealthChanged;
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -87,6 +91,11 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
         }, cancellationToken);
     }
 
+    public void SetPollInterval(TimeSpan interval)
+    {
+        // Streamer.bot uses WebSocket, not polling - no-op
+    }
+
     private async Task RunAsync(CancellationToken cancellationToken)
     {
         var delay = TimeSpan.FromSeconds(1);
@@ -99,9 +108,12 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
             {
                 SetState(firstAttempt ? ConnectionState.Connecting : ConnectionState.Reconnecting);
                 firstAttempt = false;
+                var connectStart = DateTimeOffset.UtcNow;
                 await socket.ConnectAsync(_serverUri, cancellationToken);
                 await SendSubscribeAsync(socket, cancellationToken);
+                var latency = DateTimeOffset.UtcNow - connectStart;
                 SetState(ConnectionState.Connected);
+                SetHealth(ConnectionHealth.Healthy(DateTimeOffset.UtcNow, latency));
                 delay = TimeSpan.FromSeconds(1);
                 await ReceiveLoopAsync(socket, cancellationToken);
             }
@@ -112,6 +124,7 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
                 SetState(ConnectionState.Reconnecting);
             }
             finally
@@ -143,23 +156,30 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
 
     private async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken cancellationToken)
     {
-        var buffer = new byte[16 * 1024];
-        while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
+        var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        try
         {
-            using var content = new MemoryStream();
-            WebSocketReceiveResult result;
-            do
+            while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
             {
-                result = await socket.ReceiveAsync(buffer, cancellationToken);
-                if (result.MessageType == WebSocketMessageType.Close)
-                    return;
-                content.Write(buffer, 0, result.Count);
-            } while (!result.EndOfMessage);
+                using var content = new MemoryStream();
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await socket.ReceiveAsync(buffer, cancellationToken);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                        return;
+                    content.Write(buffer, 0, result.Count);
+                } while (!result.EndOfMessage);
 
-            using var document = JsonDocument.Parse(content.ToArray());
-            if (document.RootElement.TryGetProperty("event", out var eventInfo) &&
-                document.RootElement.TryGetProperty("data", out var data))
-                PublishEvent(eventInfo, data);
+                using var document = JsonDocument.Parse(content.ToArray());
+                if (document.RootElement.TryGetProperty("event", out var eventInfo) &&
+                    document.RootElement.TryGetProperty("data", out var data))
+                    PublishEvent(eventInfo, data);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -194,14 +214,14 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
                 IsSubscriber = GetNestedBoolean(data, "user", "subscribed") || GetNestedBoolean(data, "user", "isSponsor"),
                 IsOwner = GetNestedBoolean(data, "user", "isOwner"),
                 Timestamp = ParseDateTime(GetString(data, "createdAt") ?? GetString(data, "publishedAt"))
-            }));
+            }, ChatItemSource.StreamerBotRelay));
             return;
         }
 
         if (platform == ChatPlatform.Twitch &&
             type.Equals("RewardRedemption", StringComparison.OrdinalIgnoreCase))
         {
-            ItemReceived?.Invoke(ChatItem.FromEvent(ParseRewardRedemption(data)));
+            ItemReceived?.Invoke(ChatItem.FromEvent(ParseRewardRedemption(data), ChatItemSource.StreamerBotRelay));
             return;
         }
 
@@ -229,7 +249,7 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
             Amount = GetString(data, "amount") ?? GetString(data, "viewers") ?? GetString(data, "bits"),
             Message = GetString(data, "text") ?? GetString(data, "message"),
             Timestamp = ParseDateTime(GetString(data, "createdAt") ?? GetString(data, "publishedAt"))
-        }));
+        }, ChatItemSource.StreamerBotRelay));
     }
 
     internal static ChatEvent ParseRewardRedemption(JsonElement data)
@@ -293,5 +313,11 @@ public sealed class StreamerBotSource(Uri serverUri) : IChatSource
     {
         _state = state;
         StateChanged?.Invoke(state);
+    }
+
+    private void SetHealth(ConnectionHealth health)
+    {
+        _health = health;
+        HealthChanged?.Invoke(health);
     }
 }

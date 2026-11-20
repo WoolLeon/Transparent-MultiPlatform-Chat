@@ -1,18 +1,22 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Forms = System.Windows.Forms;
 using MultiChatOverlay.App.Logging;
 using MultiChatOverlay.App.Settings;
 using MultiChatOverlay.App.Emotes;
 using MultiChatOverlay.Core.Models;
 using MultiChatOverlay.Core.Services;
+using System.Diagnostics;
 using MultiChatOverlay.Core.Sources;
 
 namespace MultiChatOverlay.App;
@@ -47,12 +51,22 @@ public partial class MainWindow : Window
         Converters = { new JsonStringEnumConverter() }
     };
 
+    // Batching queue for WebView2 messages
+    private readonly ConcurrentQueue<object> _pendingWebViewMessages = new();
+    private DispatcherTimer? _flushTimer;
+
+    // Auto-hide on inactivity
+    private DispatcherTimer? _autoHideTimer;
+    private DateTime _lastMessageTime = DateTime.UtcNow;
+    private bool _isAutoHidden = false;
+    private double _normalOpacity = 0.96;
+
     private readonly SettingsStore _settingsStore = new();
     private readonly MessageDeduplicator _deduplicator = new();
+    private readonly ChatEventDeduplicator _eventDeduplicator = new();
     private readonly ThirdPartyEmoteCatalog _thirdPartyEmotes = new();
+    private readonly ChatLogExporter _chatLogExporter = new();
     private readonly List<IChatSource> _sources = [];
-    private readonly HashSet<string> _seenEventIds = new(StringComparer.Ordinal);
-    private readonly Queue<string> _eventIdOrder = new();
     private OverlaySettings _settings = new();
     private HwndSource? _hwndSource;
     private Forms.NotifyIcon? _trayIcon;
@@ -77,14 +91,142 @@ public partial class MainWindow : Window
             SetupHotkeys();
             SetupTrayIcon();
             await InitializeChatViewAsync();
+            InitializeMessageBatching();
+            await HttpClientPool.WarmupAsync();
+
+            // Start chat log exporter if enabled
+            if (_settings.EnableChatLogExport)
+            {
+                _chatLogExporter.Start(_settings.ChatLogExportPath);
+                Log.Logger.Information("Chat log export enabled: JSONL={JsonlPath}, Count={Count}",
+                    _chatLogExporter.JsonlPath, 0);
+            }
+
+            MultiChatEventSource.Log.ApplicationStarting(GetVersion());
+
+            // Initialize auto-hide timer if enabled
+            InitializeAutoHide();
+
             await StartSourcesAsync();
         }
         catch (Exception ex)
         {
+            MultiChatEventSource.Log.UnhandledException(ex.GetType().Name, ex.Message, ex.StackTrace ?? "");
             Log.Logger.Error(ex, "Unable to initialize overlay");
             System.Windows.MessageBox.Show($"Unable to start the overlay: {ex.Message}", "Multi Chat Overlay",
                 MessageBoxButton.OK, MessageBoxImage.Error);
         }
+    }
+
+    private static string GetVersion()
+    {
+        var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+        var version = assembly.GetName().Version?.ToString(3) ?? "1.0.0";
+        return version;
+    }
+
+    private void InitializeMessageBatching()
+    {
+        _flushTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) }; // ~60fps
+        _flushTimer.Tick += async (_, _) => await FlushMessageBatchAsync();
+        _flushTimer.Start();
+    }
+
+    private void InitializeAutoHide()
+    {
+        _normalOpacity = Opacity;
+
+        if (_settings.EnableAutoHide)
+        {
+            var interval = TimeSpan.FromSeconds(Math.Max(1, _settings.AutoHideSeconds));
+            _autoHideTimer = new DispatcherTimer { Interval = interval };
+            _autoHideTimer.Tick += AutoHideTimer_Tick;
+            _autoHideTimer.Start();
+            _lastMessageTime = DateTime.UtcNow;
+            _autoHideGracePeriodEnd = DateTime.UtcNow.AddSeconds(10); // 10s grace period on startup
+        }
+    }
+
+    private DateTime _autoHideGracePeriodEnd = DateTime.MinValue;
+
+    private void AutoHideTimer_Tick(object? sender, EventArgs e)
+    {
+        if (!_settings.EnableAutoHide || _isAutoHidden)
+            return;
+
+        // Skip auto-hide during startup grace period
+        if (DateTime.UtcNow < _autoHideGracePeriodEnd)
+            return;
+
+        var inactiveSeconds = (DateTime.UtcNow - _lastMessageTime).TotalSeconds;
+        if (inactiveSeconds >= _settings.AutoHideSeconds)
+        {
+            FadeToAutoHideOpacity();
+        }
+    }
+
+    private void FadeToAutoHideOpacity()
+    {
+        if (_isAutoHidden)
+            return;
+
+        _isAutoHidden = true;
+        // Never go below 5% opacity to prevent complete disappearance
+        var targetOpacity = Math.Clamp(_settings.AutoHideOpacity, 0.05, 0.5);
+        AnimateOpacity(targetOpacity);
+        MultiChatEventSource.Log.ApplicationShuttingDown("Auto-hidden due to inactivity");
+    }
+
+    private void RestoreFromAutoHide()
+    {
+        if (!_isAutoHidden)
+            return;
+
+        _isAutoHidden = false;
+        AnimateOpacity(_normalOpacity);
+    }
+
+    private void AnimateOpacity(double targetOpacity)
+    {
+        var animation = new System.Windows.Media.Animation.DoubleAnimation
+        {
+            To = targetOpacity,
+            Duration = TimeSpan.FromMilliseconds(500),
+            EasingFunction = new System.Windows.Media.Animation.QuadraticEase { EasingMode = System.Windows.Media.Animation.EasingMode.EaseOut }
+        };
+        this.BeginAnimation(OpacityProperty, animation);
+    }
+
+    private void UpdateLastMessageTime()
+    {
+        _lastMessageTime = DateTime.UtcNow;
+        if (_isAutoHidden)
+        {
+            RestoreFromAutoHide();
+        }
+    }
+
+    private async Task FlushMessageBatchAsync()
+    {
+        if (_pendingWebViewMessages.IsEmpty)
+            return;
+
+        var batch = new List<object>();
+        while (_pendingWebViewMessages.TryDequeue(out var item) && batch.Count < 100)
+        {
+            batch.Add(item);
+        }
+
+        if (batch.Count > 0)
+        {
+            var json = JsonSerializer.Serialize(batch, ChatJsonOptions);
+            ChatView.CoreWebView2?.PostWebMessageAsJson(json);
+        }
+    }
+
+    private void QueueWebViewMessage(object message)
+    {
+        _pendingWebViewMessages.Enqueue(message);
     }
 
     private async Task InitializeChatViewAsync()
@@ -113,7 +255,12 @@ public partial class MainWindow : Window
         var twitchClientId = string.IsNullOrWhiteSpace(_settings.TwitchClientId)
             ? null
             : _settings.TwitchClientId;
-        if (_settings.ShowTwitch || _settings.ShowStreamerBot)
+
+        // Load global emotes immediately; channel emotes will load lazily when Twitch connects
+        // Load global emotes if ANY platform is enabled (global emotes work for all platforms)
+        var anyPlatformEnabled = _settings.ShowTwitch || _settings.ShowYouTube || _settings.ShowKick ||
+                                 _settings.ShowFacebook || _settings.ShowStreamerBot;
+        if (anyPlatformEnabled)
         {
             await _thirdPartyEmotes.LoadAsync(
                 _settings.TwitchChannel,
@@ -178,14 +325,30 @@ public partial class MainWindow : Window
             if (twitchToken is not null)
             {
                 var twitch = new TwitchIrcSource(_settings.TwitchChannel, _settings.TwitchUsername, twitchToken);
+                twitch.HealthChanged += health => Dispatcher.Invoke(() => OnSourceHealthChanged(ChatPlatform.Twitch, health));
+                twitch.StateChanged += state => Dispatcher.Invoke(() =>
+                {
+                    if (state == ConnectionState.Connected)
+                        MultiChatEventSource.Log.SourceConnected("Twitch", _settings.TwitchChannel);
+                    else if (state == ConnectionState.Faulted)
+                        MultiChatEventSource.Log.SourceFailed("Twitch", TwitchStatus.ToolTip?.ToString() ?? "");
+                });
                 RegisterSource(twitch);
                 TwitchStatus.ToolTip = $"Twitch: #{_settings.TwitchChannel}";
+                MultiChatEventSource.Log.SourceConnecting("Twitch", $"Channel: #{_settings.TwitchChannel}");
                 await twitch.StartAsync();
+
+                // Trigger channel emote loading now that we have a valid connection
+                _thirdPartyEmotes.LoadChannelEmotes(
+                    _settings.TwitchUsername, // Use username as channel ID fallback
+                    _settings.UseSevenTvEmotes,
+                    _settings.UseBetterTtvEmotes);
 
                 if (!string.IsNullOrWhiteSpace(_settings.TwitchClientId))
                 {
                     var eventSub = new TwitchEventSubSource(
                         _settings.TwitchClientId, _settings.TwitchUsername, twitchToken);
+                    eventSub.HealthChanged += health => Dispatcher.Invoke(() => OnSourceHealthChanged(ChatPlatform.Twitch, health));
                     RegisterSource(eventSub, displayConnectionStatus: false);
                     await eventSub.StartAsync();
                 }
@@ -201,7 +364,16 @@ public partial class MainWindow : Window
         if (_settings.ShowYouTube && !string.IsNullOrWhiteSpace(_settings.YouTubeTarget))
         {
             var youtube = new YouTubeInnerTubeChatSource(_settings.YouTubeTarget);
+            youtube.HealthChanged += health => Dispatcher.Invoke(() => OnSourceHealthChanged(ChatPlatform.YouTube, health));
+            youtube.StateChanged += state => Dispatcher.Invoke(() =>
+            {
+                if (state == ConnectionState.Connected)
+                    MultiChatEventSource.Log.SourceConnected("YouTube", _settings.YouTubeTarget);
+                else if (state == ConnectionState.Faulted)
+                    MultiChatEventSource.Log.SourceFailed("YouTube", YouTubeStatus.ToolTip?.ToString() ?? "");
+            });
             RegisterSource(youtube);
+            MultiChatEventSource.Log.SourceConnecting("YouTube", _settings.YouTubeTarget);
             await youtube.StartAsync();
         }
 
@@ -211,8 +383,21 @@ public partial class MainWindow : Window
             var token = TryUnprotectToken(_settings.FacebookAccessTokenProtected, ChatPlatform.Facebook);
             if (token is not null)
             {
-                var facebook = new FacebookLiveCommentsSource(_settings.FacebookLiveVideoId, token);
+                var facebook = new FacebookLiveCommentsSource(
+                    _settings.FacebookLiveVideoId,
+                    token,
+                    _settings.FacebookPollIntervalSeconds,
+                    _settings.FacebookMaxPollIntervalSeconds);
+                facebook.HealthChanged += health => Dispatcher.Invoke(() => OnSourceHealthChanged(ChatPlatform.Facebook, health));
+                facebook.StateChanged += state => Dispatcher.Invoke(() =>
+                {
+                    if (state == ConnectionState.Connected)
+                        MultiChatEventSource.Log.SourceConnected("Facebook", _settings.FacebookLiveVideoId);
+                    else if (state == ConnectionState.Faulted)
+                        MultiChatEventSource.Log.SourceFailed("Facebook", FacebookStatus.ToolTip?.ToString() ?? "");
+                });
                 RegisterSource(facebook);
+                MultiChatEventSource.Log.SourceConnecting("Facebook", _settings.FacebookLiveVideoId);
                 await facebook.StartAsync();
             }
         }
@@ -221,8 +406,49 @@ public partial class MainWindow : Window
             uri.Scheme is "ws" or "wss")
         {
             var streamerBot = new StreamerBotSource(uri);
+            streamerBot.HealthChanged += health => Dispatcher.Invoke(() => OnSourceHealthChanged(ChatPlatform.StreamerBot, health));
+            streamerBot.StateChanged += state => Dispatcher.Invoke(() =>
+            {
+                if (state == ConnectionState.Connected)
+                    MultiChatEventSource.Log.SourceConnected("Streamer.bot", _settings.StreamerBotUrl);
+                else if (state == ConnectionState.Faulted)
+                    MultiChatEventSource.Log.SourceFailed("Streamer.bot", StreamerBotStatus.ToolTip?.ToString() ?? "");
+            });
             RegisterSource(streamerBot);
+            MultiChatEventSource.Log.SourceConnecting("Streamer.bot", _settings.StreamerBotUrl);
             await streamerBot.StartAsync();
+        }
+    }
+
+    private void OnSourceHealthChanged(ChatPlatform platform, ConnectionHealth health)
+    {
+        // Adaptive behavior: reduce Facebook polling if unhealthy
+        if (platform == ChatPlatform.Facebook && health.ShouldReducePolling)
+        {
+            var fbSource = _sources.OfType<FacebookLiveCommentsSource>().FirstOrDefault();
+            if (fbSource != null)
+            {
+                fbSource.SetPollInterval(TimeSpan.FromSeconds(30));
+                Log.Logger.Information("Reduced Facebook poll interval to 30s due to health: {Failures} failures", health.ConsecutiveFailures);
+            }
+        }
+
+        // Update UI tooltip with health info
+        var status = platform switch
+        {
+            ChatPlatform.Twitch => TwitchStatus,
+            ChatPlatform.YouTube => YouTubeStatus,
+            ChatPlatform.Kick => KickStatus,
+            ChatPlatform.Facebook => FacebookStatus,
+            ChatPlatform.StreamerBot => StreamerBotStatus,
+            _ => null
+        };
+        if (status is not null)
+        {
+            var healthDetail = health.ShouldReducePolling ? $" (degraded: {health.ConsecutiveFailures} failures)" : "";
+            var tooltipText = status.ToolTip?.ToString() ?? "";
+            var baseText = tooltipText.Split(':').LastOrDefault()?.Trim() ?? "";
+            status.ToolTip = $"{platform}: {baseText}{healthDetail}";
         }
     }
 
@@ -261,12 +487,16 @@ public partial class MainWindow : Window
 
     private void InitializeConnectionStatus(string? twitchToken)
     {
+        var needsTwitchAuth = _settings.ShowTwitch &&
+                              (string.IsNullOrWhiteSpace(_settings.TwitchChannel) ||
+                               string.IsNullOrWhiteSpace(_settings.TwitchUsername) ||
+                               twitchToken is null);
+
         SetConnectionStatusText(
             ChatPlatform.Twitch,
             !_settings.ShowTwitch ? "Disabled in Settings" :
-            string.IsNullOrWhiteSpace(_settings.TwitchChannel) ||
-            string.IsNullOrWhiteSpace(_settings.TwitchUsername) || twitchToken is null
-                ? "Needs a channel and valid Twitch sign-in"
+            needsTwitchAuth
+                ? "Needs a channel and valid Twitch sign-in (OAuth required for chat)"
                 : "Connecting...");
         SetConnectionStatusText(
             ChatPlatform.YouTube,
@@ -331,33 +561,61 @@ public partial class MainWindow : Window
             : null;
         if (messageToRender is { } message)
         {
-            if (_settings.DeduplicateMessages && !_deduplicator.ShouldAccept(message))
+            if ((_settings.DeduplicateMessages || _settings.DeduplicateStreamerBotMessages) &&
+                !_deduplicator.ShouldAccept(message, item.Source, _settings.DeduplicateMessages,
+                    _settings.DeduplicateStreamerBotMessages))
+            {
+                MultiChatEventSource.Log.MessageDeduplicated(message.Platform.ToString(), message.Id, "Deduplicated");
                 return;
+            }
+
+            // Apply message filtering if enabled
+            if (!ShouldShowMessage(message))
+                return;
+
             if (!IsPlatformVisible(message.Platform))
                 return;
+
+            // Update last message time for auto-hide
+            UpdateLastMessageTime();
+
+            // ETW: Message received
+            MultiChatEventSource.Log.MessageReceived(
+                message.Platform.ToString(),
+                message.Username,
+                message.DisplayName,
+                message.Id);
         }
         else if (item.Event is { } chatEvent && !IsPlatformVisible(chatEvent.Platform))
         {
             return;
         }
 
-        if (item.Event is { } receivedEvent && !ShouldAcceptEvent(receivedEvent))
+        if (item.Event is { } receivedEvent &&
+            !_eventDeduplicator.ShouldAccept(receivedEvent, item.Source, _settings.DeduplicateStreamerBotEvents))
             return;
 
-        var json = JsonSerializer.Serialize(new { message = messageToRender, @event = item.Event }, ChatJsonOptions);
-        ChatView.CoreWebView2?.PostWebMessageAsJson(json);
-    }
+        // ETW: Event received
+        if (item.Event is { } evt)
+        {
+            MultiChatEventSource.Log.EventReceived(
+                evt.Platform.ToString(),
+                evt.Type,
+                evt.User,
+                evt.Id);
+        }
 
-    private bool ShouldAcceptEvent(ChatEvent chatEvent)
-    {
-        var key = $"{chatEvent.Platform}:{chatEvent.Id}";
-        if (!_seenEventIds.Add(key))
-            return false;
+        // Log to chat export if enabled
+        if (_chatLogExporter.IsEnabled)
+        {
+            if (messageToRender is { } msg)
+                _chatLogExporter.LogMessage(msg);
+            else if (item.Event is { } chatEvent)
+                _chatLogExporter.LogEvent(chatEvent);
+        }
 
-        _eventIdOrder.Enqueue(key);
-        while (_eventIdOrder.Count > 2000)
-            _seenEventIds.Remove(_eventIdOrder.Dequeue());
-        return true;
+        // Queue for batched delivery instead of immediate PostWebMessageAsJson
+        QueueWebViewMessage(new { message = messageToRender, @event = item.Event });
     }
 
     private bool IsPlatformVisible(ChatPlatform platform) => platform switch
@@ -369,6 +627,85 @@ public partial class MainWindow : Window
         ChatPlatform.StreamerBot => _settings.ShowStreamerBot,
         _ => true
     };
+
+    private bool ShouldShowMessage(ChatMessage message)
+    {
+        if (!_settings.EnableMessageFiltering)
+            return true;
+
+        // Check ignored users (case-insensitive)
+        if (_settings.IgnoredUsers.Count > 0)
+        {
+            var username = message.Username?.ToLowerInvariant() ?? string.Empty;
+            if (_settings.IgnoredUsers.Any(u => u.Equals(username, StringComparison.OrdinalIgnoreCase)))
+            {
+                MultiChatEventSource.Log.MessageFiltered(message.Platform.ToString(), message.Username ?? string.Empty, "IgnoredUser");
+                return false;
+            }
+        }
+
+        var content = GetMessageText(message);
+
+        // Check block patterns
+        if (_settings.MessageBlockPatterns.Count > 0)
+        {
+            foreach (var pattern in _settings.MessageBlockPatterns)
+            {
+                try
+                {
+                    if (Regex.IsMatch(content, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+                    {
+                        MultiChatEventSource.Log.MessageFiltered(message.Platform.ToString(), message.Username ?? string.Empty, $"BlockPattern:{pattern}");
+                        return false;
+                    }
+                }
+                catch (ArgumentException ex)
+                {
+                    Log.Logger.Warning(ex, "Invalid block regex pattern: {Pattern}", pattern);
+                }
+            }
+        }
+
+        // Check allow patterns (if any are set, ONLY messages matching at least one are shown)
+        if (_settings.MessageAllowPatterns.Count > 0)
+        {
+            var matched = false;
+            foreach (var pattern in _settings.MessageAllowPatterns)
+            {
+                try
+                {
+                    if (Regex.IsMatch(content, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                catch (ArgumentException ex)
+                {
+                    Log.Logger.Warning(ex, "Invalid allow regex pattern: {Pattern}", pattern);
+                }
+            }
+
+            if (!matched)
+            {
+                MultiChatEventSource.Log.MessageFiltered(message.Platform.ToString(), message.Username ?? string.Empty, "NoAllowMatch");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static string GetMessageText(ChatMessage message)
+    {
+        var parts = new System.Text.StringBuilder();
+        foreach (var part in message.MessageParts)
+        {
+            if (part is TextPart textPart)
+                parts.Append(textPart.Text);
+        }
+        return parts.ToString();
+    }
 
     private void UpdateConnectionStatus(ChatPlatform platform, ConnectionState state)
     {
@@ -438,7 +775,7 @@ public partial class MainWindow : Window
                 ToggleVisibility();
                 break;
             case HotkeyClear:
-                ChatView.CoreWebView2?.PostWebMessageAsJson("{\"clear\":true}");
+                QueueWebViewMessage(new { clear = true });
                 break;
             case HotkeyOpacityUp:
                 SetOpacity(Opacity + 0.05);
@@ -499,6 +836,9 @@ public partial class MainWindow : Window
         LockButton.ToolTip = isLocked
             ? "Unlock overlay (Ctrl+Shift+L)"
             : "Lock overlay (Ctrl+Shift+L)";
+        OverlayFrame.BorderBrush = isLocked
+            ? System.Windows.Media.Brushes.Transparent
+            : new SolidColorBrush(System.Windows.Media.Color.FromArgb(191, 255, 255, 255));
         Toolbar.Visibility = isLocked ? Visibility.Collapsed : Visibility.Visible;
         ToolbarRow.Height = isLocked ? new GridLength(0) : new GridLength(42);
         ResizeGrip.Visibility = isLocked ? Visibility.Collapsed : Visibility.Visible;
@@ -545,8 +885,7 @@ public partial class MainWindow : Window
     private void IncreaseOpacity_Click(object sender, RoutedEventArgs e) => SetOpacity(Opacity + 0.05);
     private void DecreaseOpacity_Click(object sender, RoutedEventArgs e) => SetOpacity(Opacity - 0.05);
     private void ResetOpacity_Click(object sender, RoutedEventArgs e) => SetOpacity(1);
-    private void ClearChat_Click(object sender, RoutedEventArgs e) =>
-        ChatView.CoreWebView2?.PostWebMessageAsJson("{\"clear\":true}");
+    private void ClearChat_Click(object sender, RoutedEventArgs e) => QueueWebViewMessage(new { clear = true });
 
     private void BringToTop_Click(object sender, RoutedEventArgs e)
     {
@@ -739,8 +1078,12 @@ public partial class MainWindow : Window
     {
         try
         {
+            _flushTimer?.Stop();
+            _autoHideTimer?.Stop();
             await StopSourcesAsync();
             await SaveSettingsAsync();
+            _chatLogExporter.Dispose(); // Stop chat log export
+            HttpClientPool.Dispose(); // Release HTTP connection pools
             _cssWatcher?.Dispose();
             _cssReloadDelay?.Cancel();
             _cssReloadDelay?.Dispose();
@@ -748,9 +1091,12 @@ public partial class MainWindow : Window
             var handle = new WindowInteropHelper(this).Handle;
             for (var id = HotkeyLock; id <= HotkeyOpacityDown; id++)
                 UnregisterHotKey(handle, id);
+
+            MultiChatEventSource.Log.ApplicationShuttingDown("User requested");
         }
         catch (Exception ex)
         {
+            MultiChatEventSource.Log.UnhandledException(ex.GetType().Name, ex.Message, ex.StackTrace ?? "");
             Log.Logger.Error(ex, "Error while shutting down overlay services");
         }
         finally

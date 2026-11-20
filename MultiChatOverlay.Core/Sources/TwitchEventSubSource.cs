@@ -1,9 +1,11 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Net.WebSockets;
 using System.Text.Json;
 using MultiChatOverlay.Core.Models;
+using MultiChatOverlay.Core.Services;
 
 namespace MultiChatOverlay.Core.Sources;
 
@@ -12,7 +14,6 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
     private static readonly Uri EventSubUri = new("wss://eventsub.wss.twitch.tv/ws");
     private static readonly Uri UsersUri = new("https://api.twitch.tv/helix/users");
     private static readonly Uri SubscriptionsUri = new("https://api.twitch.tv/helix/eventsub/subscriptions");
-    private static readonly HttpClient HttpClient = new();
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly string _clientId = Require(clientId, nameof(clientId));
@@ -21,12 +22,15 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
     private CancellationTokenSource? _lifetime;
     private Task? _runTask;
     private ConnectionState _state = ConnectionState.Disconnected;
+    private ConnectionHealth _health = ConnectionHealth.Unhealthy(DateTimeOffset.MinValue, 0);
 
     public ChatPlatform Platform => ChatPlatform.Twitch;
     public ConnectionState State => _state;
+    public ConnectionHealth Health => _health;
     public event Action<ChatItem>? ItemReceived;
     public event Action<ConnectionState>? StateChanged;
     public event Action<Exception>? ErrorOccurred;
+    public event Action<ConnectionHealth>? HealthChanged;
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -63,6 +67,11 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
 
     public async ValueTask DisposeAsync() => await StopAsync();
 
+    public void SetPollInterval(TimeSpan interval)
+    {
+        // EventSub uses WebSocket, not polling - no-op
+    }
+
     private async Task RunAsync(CancellationToken cancellationToken)
     {
         var retry = TimeSpan.FromSeconds(1);
@@ -76,23 +85,28 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
             {
                 SetState(firstAttempt ? ConnectionState.Connecting : ConnectionState.Reconnecting);
                 firstAttempt = false;
+                var connectStart = DateTimeOffset.UtcNow;
                 await socket.ConnectAsync(reconnectUri ?? EventSubUri, cancellationToken);
                 var result = await ReceiveSessionAsync(socket, subscriptionsMigrated, cancellationToken);
+                var latency = DateTimeOffset.UtcNow - connectStart;
                 if (result.ReconnectUri is not null)
                 {
                     reconnectUri = result.ReconnectUri;
                     subscriptionsMigrated = true;
                     retry = TimeSpan.FromSeconds(1);
+                    SetHealth(_health.RecordSuccess(latency));
                     continue;
                 }
 
                 reconnectUri = null;
                 subscriptionsMigrated = false;
+                SetHealth(_health.RecordSuccess(latency));
                 SetState(ConnectionState.Reconnecting);
             }
             catch (TwitchEventSubRequestException ex)
             {
                 ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
                 SetState(ConnectionState.Faulted);
                 break;
             }
@@ -103,6 +117,7 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
                 SetState(ConnectionState.Reconnecting);
                 reconnectUri = null;
                 subscriptionsMigrated = false;
@@ -121,64 +136,71 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
         bool subscriptionsMigrated,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[16 * 1024];
-        var welcomed = false;
-        while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
+        var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        try
         {
-            using var content = new MemoryStream();
-            WebSocketReceiveResult result;
-            do
+            var welcomed = false;
+            while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
             {
-                result = await socket.ReceiveAsync(buffer, cancellationToken);
-                if (result.MessageType == WebSocketMessageType.Close)
-                    return new SessionResult(null);
-                content.Write(buffer, 0, result.Count);
-            } while (!result.EndOfMessage);
-
-            using var document = JsonDocument.Parse(content.ToArray());
-            var root = document.RootElement;
-            if (!root.TryGetProperty("metadata", out var metadata) ||
-                !metadata.TryGetProperty("message_type", out var messageTypeElement))
-                continue;
-
-            var messageType = messageTypeElement.GetString();
-            if (messageType == "session_welcome")
-            {
-                if (welcomed)
-                    continue;
-                welcomed = true;
-                if (!subscriptionsMigrated)
+                using var content = new MemoryStream();
+                WebSocketReceiveResult result;
+                do
                 {
-                    var sessionId = root.GetProperty("payload").GetProperty("session").GetProperty("id").GetString()
-                                    ?? throw new InvalidDataException("Twitch EventSub welcome message did not include a session ID.");
-                    var broadcasterId = await GetBroadcasterIdAsync(cancellationToken);
-                    await CreateSubscriptionAsync(
-                        "channel.channel_points_custom_reward_redemption.add", sessionId, broadcasterId, cancellationToken);
-                    await CreateSubscriptionAsync(
-                        "channel.channel_points_automatic_reward_redemption.add", sessionId, broadcasterId, cancellationToken);
+                    result = await socket.ReceiveAsync(buffer, cancellationToken);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                        return new SessionResult(null);
+                    content.Write(buffer, 0, result.Count);
+                } while (!result.EndOfMessage);
+
+                using var document = JsonDocument.Parse(content.ToArray());
+                var root = document.RootElement;
+                if (!root.TryGetProperty("metadata", out var metadata) ||
+                    !metadata.TryGetProperty("message_type", out var messageTypeElement))
+                    continue;
+
+                var messageType = messageTypeElement.GetString();
+                if (messageType == "session_welcome")
+                {
+                    if (welcomed)
+                        continue;
+                    welcomed = true;
+                    if (!subscriptionsMigrated)
+                    {
+                        var sessionId = root.GetProperty("payload").GetProperty("session").GetProperty("id").GetString()
+                                        ?? throw new InvalidDataException("Twitch EventSub welcome message did not include a session ID.");
+                        var broadcasterId = await GetBroadcasterIdAsync(cancellationToken);
+                        await CreateSubscriptionAsync(
+                            "channel.channel_points_custom_reward_redemption.add", sessionId, broadcasterId, cancellationToken);
+                        await CreateSubscriptionAsync(
+                            "channel.channel_points_automatic_reward_redemption.add", sessionId, broadcasterId, cancellationToken);
+                    }
+
+                    SetState(ConnectionState.Connected);
                 }
+                else if (messageType == "notification" && root.TryGetProperty("payload", out var payload) &&
+                         payload.TryGetProperty("event", out var eventData))
+                {
+                    var type = metadata.TryGetProperty("subscription_type", out var subscriptionType)
+                        ? subscriptionType.GetString()
+                        : null;
+                    var item = ParseRedemption(type, eventData);
+                    if (item is not null)
+                        ItemReceived?.Invoke(item);
+                }
+                else if (messageType == "session_reconnect" &&
+                         root.GetProperty("payload").GetProperty("session").TryGetProperty("reconnect_url", out var reconnectElement) &&
+                         Uri.TryCreate(reconnectElement.GetString(), UriKind.Absolute, out var reconnectTarget))
+                {
+                    return new SessionResult(reconnectTarget);
+                }
+            }
 
-                SetState(ConnectionState.Connected);
-            }
-            else if (messageType == "notification" && root.TryGetProperty("payload", out var payload) &&
-                     payload.TryGetProperty("event", out var eventData))
-            {
-                var type = metadata.TryGetProperty("subscription_type", out var subscriptionType)
-                    ? subscriptionType.GetString()
-                    : null;
-                var item = ParseRedemption(type, eventData);
-                if (item is not null)
-                    ItemReceived?.Invoke(item);
-            }
-            else if (messageType == "session_reconnect" &&
-                     root.GetProperty("payload").GetProperty("session").TryGetProperty("reconnect_url", out var reconnectElement) &&
-                     Uri.TryCreate(reconnectElement.GetString(), UriKind.Absolute, out var reconnectTarget))
-            {
-                return new SessionResult(reconnectTarget);
-            }
+            return new SessionResult(null);
         }
-
-        return new SessionResult(null);
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private async Task<string> GetBroadcasterIdAsync(CancellationToken cancellationToken)
@@ -187,7 +209,7 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         request.Headers.Add("Client-Id", _clientId);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
-        using var response = await HttpClient.SendAsync(request, cancellationToken);
+        using var response = await HttpClientPool.Shared.SendAsync(request, cancellationToken);
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
         EnsureSuccess(response.StatusCode, body);
         using var document = JsonDocument.Parse(body);
@@ -216,7 +238,7 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
         };
         request.Headers.Add("Client-Id", _clientId);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
-        using var response = await HttpClient.SendAsync(request, cancellationToken);
+        using var response = await HttpClientPool.Shared.SendAsync(request, cancellationToken);
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
         EnsureSuccess(response.StatusCode, body);
     }
@@ -285,6 +307,12 @@ public sealed class TwitchEventSubSource(string clientId, string broadcasterLogi
 
         _state = state;
         StateChanged?.Invoke(state);
+    }
+
+    private void SetHealth(ConnectionHealth health)
+    {
+        _health = health;
+        HealthChanged?.Invoke(health);
     }
 
     private sealed record SessionResult(Uri? ReconnectUri);

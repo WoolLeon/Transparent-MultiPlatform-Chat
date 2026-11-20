@@ -16,6 +16,8 @@ public sealed class OverlaySettings
     public bool ShowFacebook { get; set; } = true;
     public bool ShowStreamerBot { get; set; } = true;
     public bool DeduplicateMessages { get; set; } = true;
+    public bool DeduplicateStreamerBotMessages { get; set; } = true;
+    public bool DeduplicateStreamerBotEvents { get; set; } = true;
     public bool UseSevenTvEmotes { get; set; } = true;
     public bool UseBetterTtvEmotes { get; set; } = true;
     public bool UseFrankerFaceZEmotes { get; set; } = true;
@@ -66,7 +68,25 @@ public sealed class OverlaySettings
     public string? FacebookAppIdLegacy { get; set; }
     public string FacebookLiveVideoId { get; set; } = string.Empty;
     public string? FacebookAccessTokenProtected { get; set; }
+    public int FacebookPollIntervalSeconds { get; set; } = 5;
+    public int FacebookMaxPollIntervalSeconds { get; set; } = 60;
     public string? CustomCssPath { get; set; }
     public string CustomCss { get; set; } = string.Empty;
     public List<string> CssThemePaths { get; set; } = [];
+    public bool EnableChatLogExport { get; set; } = true;
+    public string? ChatLogExportPath { get; set; }
+
+    // Message filtering
+    public bool EnableMessageFiltering { get; set; } = false;
+    public List<string> MessageAllowPatterns { get; set; } = [];
+    public List<string> MessageBlockPatterns { get; set; } = [];
+    public List<string> IgnoredUsers { get; set; } = [];
+
+    // Auto-hide
+    public bool EnableAutoHide { get; set; } = false;
+    public int AutoHideSeconds { get; set; } = 30;
+    public double AutoHideOpacity { get; set; } = 0.1;
+
+    // Ensure AutoHideOpacity never goes below 0.05
+    public double SafeAutoHideOpacity => Math.Clamp(AutoHideOpacity, 0.05, 0.5);
 }

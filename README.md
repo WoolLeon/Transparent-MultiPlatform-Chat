@@ -121,7 +121,7 @@ Open **Settings → Emotes** to independently enable or disable 7TV, BetterTTV, 
 1. In Streamer.bot, enable its WebSocket server and note the host/port (default in this app: `ws://127.0.0.1:8080/`).
 2. Enable **Settings → Streamer.bot → Connect** only if you want Streamer.bot-relayed events. Twitch channel-point redemptions are received directly through EventSub and do not require Streamer.bot.
 3. The connector supports `DoAction` by action name and `SendMessage` for Twitch/Kick/YouTube programmatically. Add Streamer.bot actions and platform permissions there before calling these methods from an extension.
-4. Streamer.bot event relay and native sources can deliver duplicate messages; the default dedupe uses `(platform, message ID)`. Disable dedupe in General if this is undesirable. IDs that differ between sources cannot be recognized as duplicates.
+4. If Streamer.bot and native sources are both enabled, **Settings → Streamer.bot → Duplicate prevention** can suppress matching relayed chat and alerts. Chat matches use platform, username and normalized message text within 8 seconds; alerts match platform, type and user within 15 seconds (amounts must agree when both sources provide one). The first copy is kept. The independent **General → Ignore repeated platform message IDs** option handles repeated chat IDs; duplicate alert IDs are always suppressed.
 
 ## Hotkeys
 

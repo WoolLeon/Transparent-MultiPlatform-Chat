@@ -141,9 +141,12 @@
                 <ListBox x:Name="SettingsNavigation" SelectionChanged="SettingsNavigation_SelectionChanged"
                          SelectedIndex="0">
                     <ListBoxItem Content="General"/>
+                    <ListBoxItem Content="Profiles"/>
                     <ListBoxItem Content="Connections"/>
                     <ListBoxItem Content="Appearance"/>
                     <ListBoxItem Content="Emotes"/>
+                    <ListBoxItem Content="Filtering"/>
+                    <ListBoxItem Content="Export"/>
                     <ListBoxItem Content="Events"/>
                     <ListBoxItem Content="Hotkeys"/>
                     <ListBoxItem Content="Streamer.bot"/>
@@ -161,7 +164,42 @@
                                    Foreground="{StaticResource MutedBrush}" Margin="0,0,0,16"/>
                         <TextBlock Text="Overlay opacity" FontWeight="SemiBold" Margin="0,0,0,5"/>
                         <Slider x:Name="OpacitySlider" Minimum="0.25" Maximum="1" TickFrequency="0.05"/>
-                        <CheckBox x:Name="DedupeCheckBox" Content="Deduplicate messages across sources" Margin="0,14,0,0"/>
+                        <CheckBox x:Name="DedupeCheckBox" Content="Ignore repeated platform message IDs" Margin="0,14,0,0"/>
+
+                        <GroupBox Header="Auto-hide on Inactivity" Margin="0,14,0,0">
+                            <StackPanel>
+                                <CheckBox x:Name="EnableAutoHideCheckBox" Content="Fade overlay when no new messages arrive" Margin="0,0,0,8"/>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <TextBlock Text="Inactivity timeout (seconds)" VerticalAlignment="Center" Width="180"/>
+                                    <TextBox x:Name="AutoHideSecondsBox" Width="60" Text="30" ToolTip="Seconds without new messages before fading (5-3600)"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <TextBlock Text="Faded opacity" VerticalAlignment="Center" Width="180"/>
+                                    <Slider x:Name="AutoHideOpacitySlider" Minimum="0.05" Maximum="0.5" TickFrequency="0.05" Width="200" Value="0.1"/>
+                                </StackPanel>
+                                <TextBlock Text="When enabled, the overlay will fade to the specified opacity after the timeout with no new messages. Any new message will restore full opacity."
+                                           Foreground="{StaticResource MutedBrush}" FontSize="11" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </GroupBox>
+                    </StackPanel>
+                </TabItem>
+                <TabItem Header="Profiles">
+                    <StackPanel>
+                        <TextBlock Text="Profiles" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,18"/>
+                        <TextBlock Text="Manage multiple streamer configurations. Each profile stores its own connections, appearance, and settings."
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,0,16"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                            <TextBlock Text="Active Profile:" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                            <ComboBox x:Name="ProfileSelector" Width="250" SelectionChanged="ProfileSelector_SelectionChanged"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                            <Button x:Name="NewProfileButton" Content="New Profile..." Padding="10,4" Click="NewProfile_Click" Margin="0,0,8,0"/>
+                            <Button x:Name="RenameProfileButton" Content="Rename" Padding="10,4" Click="RenameProfile_Click" Margin="0,0,8,0"/>
+                            <Button x:Name="DeleteProfileButton" Content="Delete" Padding="10,4" Click="DeleteProfile_Click" Margin="0,0,8,0"
+                                    Foreground="#FF6B6B" BorderBrush="#8A3A3A" Background="#3A2020"/>
+                            <Button x:Name="DuplicateProfileButton" Content="Duplicate" Padding="10,4" Click="DuplicateProfile_Click"/>
+                        </StackPanel>
+                        <TextBlock x:Name="ProfileInfoText" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,8,0,0"/>
                     </StackPanel>
                 </TabItem>
                 <TabItem Header="Connections">
@@ -235,7 +273,15 @@
                                         <Button Content="Sign in to Facebook" Padding="10,4" Click="FacebookSignIn_Click" DockPanel.Dock="Left"/>
                                         <TextBlock x:Name="FacebookAccountStatus" Text="Not signed in" VerticalAlignment="Center" Margin="10,0,0,0"/>
                                     </DockPanel>
-                                    <TextBlock Text="Configure Facebook Login and the Pages permissions required to read live-video comments in your Meta app."
+                                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                        <TextBlock Text="Poll interval (seconds)" VerticalAlignment="Center" Width="160"/>
+                                        <TextBox x:Name="FacebookPollIntervalBox" Width="60" Text="5" ToolTip="How often to poll Facebook Graph API for new comments (1-300)"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                        <TextBlock Text="Max poll interval (seconds)" VerticalAlignment="Center" Width="160"/>
+                                        <TextBox x:Name="FacebookMaxPollIntervalBox" Width="60" Text="60" ToolTip="Maximum backoff interval on rate limits (5-3600)"/>
+                                    </StackPanel>
+                                    <TextBlock Text="Configure Facebook Login and the Pages permissions required to read live-video comments in your Meta app. Poll interval controls how often the app checks for new comments; increase to reduce API calls."
                                                Foreground="{StaticResource MutedBrush}" Margin="0,7,0,0" FontSize="11"/>
                                 </StackPanel>
                             </GroupBox>
@@ -289,6 +335,98 @@
                         <CheckBox x:Name="FrankerFaceZEmotesEnabled" Content="Enable FrankerFaceZ emotes"/>
                     </StackPanel>
                 </TabItem>
+                <TabItem Header="Filtering">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <TextBlock Text="Message Filtering" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,18"/>
+                            <TextBlock Text="Filter chat messages by regex patterns or user names. All patterns use .NET regex syntax (case-insensitive). Enable filtering to apply these rules."
+                                       Foreground="{StaticResource MutedBrush}" Margin="0,0,0,16" TextWrapping="Wrap"/>
+                            <CheckBox x:Name="EnableMessageFilteringCheckBox" Content="Enable message filtering" Margin="0,0,0,16"/>
+
+                            <GroupBox Header="Allow Patterns (messages matching ANY of these are shown)" Margin="0,0,0,12">
+                                <StackPanel>
+                                    <TextBlock Text="One pattern per line. If allow patterns are set, ONLY messages matching at least one pattern will be shown." Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                                    <TextBox x:Name="AllowPatternsBox" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                                             Height="100" FontFamily="Consolas" TextWrapping="NoWrap"
+                                             Margin="0,0,0,4"/>
+                                    <TextBlock x:Name="AllowPatternsHint" Text="Example: ^!cmd\s|^\?help$|^!so\s" Foreground="{StaticResource MutedBrush}" FontSize="11"/>
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox Header="Block Patterns (messages matching ANY of these are hidden)" Margin="0,0,0,12">
+                                <StackPanel>
+                                    <TextBlock Text="One pattern per line. Messages matching these patterns will be hidden. Applied after allow patterns." Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                                    <TextBox x:Name="BlockPatternsBox" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                                             Height="100" FontFamily="Consolas" TextWrapping="NoWrap"
+                                             Margin="0,0,0,4"/>
+                                    <TextBlock x:Name="BlockPatternsHint" Text="Example: http[s]?://|www\.|discord\.gg/|@everyone|@here" Foreground="{StaticResource MutedBrush}" FontSize="11"/>
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox Header="Ignored Users (messages from these users are hidden)" Margin="0,0,0,12">
+                                <StackPanel>
+                                    <TextBlock Text="One username per line (case-insensitive). Applied regardless of allow/block patterns." Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                                    <TextBox x:Name="IgnoredUsersBox" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                                             Height="80" FontFamily="Consolas" TextWrapping="NoWrap"
+                                             Margin="0,0,0,4"/>
+                                    <TextBlock x:Name="IgnoredUsersHint" Text="Example: Nightbot|StreamElements|Moobot|Streamelements" Foreground="{StaticResource MutedBrush}" FontSize="11"/>
+                                </StackPanel>
+                            </GroupBox>
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
+                <TabItem Header="Export">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <TextBlock Text="OBS Browser Source Export" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,18"/>
+                            <TextBlock Text="Export a standalone HTML file that can be used as an OBS Browser Source. The exported file includes all CSS, JavaScript, and current theme settings embedded."
+                                       Foreground="{StaticResource MutedBrush}" Margin="0,0,0,16" TextWrapping="Wrap"/>
+
+                            <GroupBox Header="Export Settings" Margin="0,0,0,12">
+                                <StackPanel>
+                                    <TextBlock Text="Theme to embed:" FontWeight="SemiBold" Margin="0,0,0,5"/>
+                                    <ComboBox x:Name="ExportThemePicker" Width="250" HorizontalAlignment="Left" Margin="0,0,0,12">
+                                        <ComboBoxItem Content="Current Theme" IsSelected="True"/>
+                                        <ComboBoxItem Content="Default"/>
+                                        <ComboBoxItem Content="Compact"/>
+                                        <ComboBoxItem Content="High contrast"/>
+                                        <ComboBoxItem Content="Sleek Dark"/>
+                                    </ComboBox>
+
+                                    <CheckBox x:Name="ExportIncludeCustomCssCheckBox" Content="Include inline CSS override" IsChecked="True" Margin="0,0,0,8"/>
+                                    <CheckBox x:Name="ExportIncludeSampleMessagesCheckBox" Content="Include sample messages for preview" IsChecked="True" Margin="0,0,0,8"/>
+                                    <CheckBox x:Name="ExportAutoScrollCheckBox" Content="Auto-scroll to new messages" IsChecked="True" Margin="0,0,0,12"/>
+
+                                    <TextBlock Text="Background:" FontWeight="SemiBold" Margin="0,0,0,5"/>
+                                    <ComboBox x:Name="ExportBackgroundPicker" Width="200" HorizontalAlignment="Left" Margin="0,0,0,12">
+                                        <ComboBoxItem Content="Transparent" IsSelected="True"/>
+                                        <ComboBoxItem Content="Semi-transparent dark (#1B1B1BCC)"/>
+                                        <ComboBoxItem Content="Opaque dark (#1B1B1B)"/>
+                                        <ComboBoxItem Content="Custom color..."/>
+                                    </ComboBox>
+
+                                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                        <Button x:Name="ExportPreviewButton" Content="Preview in Browser" Padding="12,6" Click="ExportPreview_Click" Margin="0,0,8,0"/>
+                                        <Button x:Name="ExportSaveButton" Content="Save HTML File..." Padding="12,6" Click="ExportSave_Click"/>
+                                    </StackPanel>
+
+                                    <TextBlock x:Name="ExportStatusText" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,8,0,0"/>
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox Header="About OBS Browser Source" Margin="0,0,0,12">
+                                <StackPanel>
+                                    <TextBlock Text="To use the exported HTML in OBS:" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,4" TextWrapping="Wrap"/>
+                                    <TextBlock Text="1. Add a 'Browser' source in OBS" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                    <TextBlock Text="2. Check 'Local file' and select the exported HTML file" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                    <TextBlock Text="3. Set Width/Height to match your overlay size" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                    <TextBlock Text="4. Enable 'Control audio via OBS' if you need audio" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                    <TextBlock Text="5. The browser source will display the chat overlay - messages won't update live (static export). For live updates, use the WPF overlay window directly." Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </GroupBox>
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
                 <TabItem Header="Events">
                     <StackPanel>
                         <TextBlock Text="Events" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,16"/>
@@ -311,8 +449,17 @@
                         <CheckBox x:Name="StreamerBotEnabled" Content="Connect to Streamer.bot"/>
                         <TextBlock Text="WebSocket URL" FontWeight="SemiBold" Margin="0,12,0,5"/>
                         <TextBox x:Name="StreamerBotUrlBox" Width="300" HorizontalAlignment="Left"/>
-                        <TextBlock Margin="0,12,0,0" Foreground="{StaticResource MutedBrush}" LineHeight="22"
+                        <TextBlock Text="Duplicate prevention" FontWeight="SemiBold" Margin="0,16,0,8"/>
+                        <CheckBox x:Name="StreamerBotMessageDedupe"
+                                  Content="Suppress relayed chat already received from the native platform"
+                                  Margin="0,0,0,7"/>
+                        <CheckBox x:Name="StreamerBotEventDedupe"
+                                  Content="Suppress relayed alerts already received from the native platform"
+                                  Margin="0,0,0,7"/>
+                        <TextBlock Margin="0,4,0,0" Foreground="{StaticResource MutedBrush}" LineHeight="22"
                                    Text="Streamer.bot is optional for native Twitch channel point events, which use your Twitch sign-in. This connector adds Streamer.bot-relayed Twitch, YouTube and Kick events and supports SendMessage and DoAction."/>
+                        <TextBlock Margin="0,4,0,0" Foreground="{StaticResource MutedBrush}" LineHeight="22"
+                                   Text="Relay matching compares platform, user and message or alert details within a short window. The first copy is kept. Repeated platform IDs are controlled separately under General."/>
                     </StackPanel>
                 </TabItem>
                 <TabItem Header="Advanced">

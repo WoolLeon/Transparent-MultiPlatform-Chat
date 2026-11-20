@@ -1,6 +1,8 @@
 **/bin/
 **/obj/
 /publish/
+/Final/
+/Final.zip
 /installer/Output/
 **/*.user
 **/*.suo

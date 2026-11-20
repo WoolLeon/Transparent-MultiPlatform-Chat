@@ -2,12 +2,12 @@ using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using MultiChatOverlay.Core.Models;
+using MultiChatOverlay.Core.Services;
 
 namespace MultiChatOverlay.Core.Sources;
 
-public sealed class FacebookLiveCommentsSource(string liveVideoId, string accessToken) : IChatSource
+public sealed class FacebookLiveCommentsSource(string liveVideoId, string accessToken, int pollIntervalSeconds = 5, int maxPollIntervalSeconds = 60) : IChatSource
 {
-    private static readonly HttpClient HttpClient = new();
     private const string GraphVersion = "v27.0";
     private const int SeenIdCapacity = 1000;
     private readonly string _liveVideoId = ValidateRequired(liveVideoId, nameof(liveVideoId));
@@ -17,13 +17,18 @@ public sealed class FacebookLiveCommentsSource(string liveVideoId, string access
     private CancellationTokenSource? _lifetime;
     private Task? _runTask;
     private ConnectionState _state = ConnectionState.Disconnected;
+    private ConnectionHealth _health = ConnectionHealth.Unhealthy(DateTimeOffset.MinValue, 0);
     private bool _initialRead = true;
+    private TimeSpan _pollInterval = TimeSpan.FromSeconds(Math.Clamp(pollIntervalSeconds, 1, 300));
+    private readonly TimeSpan _maxPollInterval = TimeSpan.FromSeconds(Math.Clamp(maxPollIntervalSeconds, 5, 3600));
 
     public ChatPlatform Platform => ChatPlatform.Facebook;
     public ConnectionState State => _state;
+    public ConnectionHealth Health => _health;
     public event Action<ChatItem>? ItemReceived;
     public event Action<ConnectionState>? StateChanged;
     public event Action<Exception>? ErrorOccurred;
+    public event Action<ConnectionHealth>? HealthChanged;
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -60,6 +65,11 @@ public sealed class FacebookLiveCommentsSource(string liveVideoId, string access
 
     public async ValueTask DisposeAsync() => await StopAsync();
 
+    public void SetPollInterval(TimeSpan interval)
+    {
+        _pollInterval = TimeSpan.FromSeconds(Math.Clamp(interval.TotalSeconds, 1, _maxPollInterval.TotalSeconds));
+    }
+
     private async Task RunAsync(CancellationToken cancellationToken)
     {
         var retry = TimeSpan.FromSeconds(1);
@@ -70,24 +80,50 @@ public sealed class FacebookLiveCommentsSource(string liveVideoId, string access
             {
                 SetState(firstAttempt ? ConnectionState.Connecting : ConnectionState.Reconnecting);
                 firstAttempt = false;
+                var requestStart = DateTimeOffset.UtcNow;
+
                 using var request = new HttpRequestMessage(HttpMethod.Get, BuildRequestUri());
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
-                using var response = await HttpClient.SendAsync(request, cancellationToken);
+                using var response = await HttpClientPool.Facebook.SendAsync(request, cancellationToken);
+
+                if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                {
+                    // Rate limited - back off
+                    var retryAfter = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(60);
+                    _pollInterval = TimeSpan.FromSeconds(Math.Min(_pollInterval.TotalSeconds * 2, _maxPollInterval.TotalSeconds));
+                    ErrorOccurred?.Invoke(new HttpRequestException($"Rate limited, retry after {retryAfter.TotalSeconds}s"));
+                    SetHealth(_health.RecordFailure());
+                    SetState(ConnectionState.Reconnecting);
+                    await Task.Delay(retryAfter, cancellationToken);
+                    continue;
+                }
+
                 response.EnsureSuccessStatusCode();
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
                 using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+
+                var latency = DateTimeOffset.UtcNow - requestStart;
                 SetState(ConnectionState.Connected);
+                SetHealth(_health.RecordSuccess(latency));
                 retry = TimeSpan.FromSeconds(1);
                 ParseComments(document.RootElement);
-                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                await Task.Delay(_pollInterval, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 break;
             }
+            catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
+                SetState(ConnectionState.Faulted);
+                break; // Don't retry on auth failure
+            }
             catch (Exception ex) when (ex is HttpRequestException or JsonException)
             {
                 ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
                 SetState(ConnectionState.Reconnecting);
                 await Task.Delay(retry, cancellationToken);
                 retry = TimeSpan.FromSeconds(Math.Min(retry.TotalSeconds * 2, 30));
@@ -95,6 +131,7 @@ public sealed class FacebookLiveCommentsSource(string liveVideoId, string access
             catch (Exception ex)
             {
                 ErrorOccurred?.Invoke(ex);
+                SetHealth(_health.RecordFailure());
                 SetState(ConnectionState.Reconnecting);
                 await Task.Delay(retry, cancellationToken);
                 retry = TimeSpan.FromSeconds(Math.Min(retry.TotalSeconds * 2, 30));
@@ -164,5 +201,11 @@ public sealed class FacebookLiveCommentsSource(string liveVideoId, string access
     {
         _state = state;
         StateChanged?.Invoke(state);
+    }
+
+    private void SetHealth(ConnectionHealth health)
+    {
+        _health = health;
+        HealthChanged?.Invoke(health);
     }
 }

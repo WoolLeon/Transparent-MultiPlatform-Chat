@@ -4,6 +4,10 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!-- Trimming support -->
+    <TrimMode>partial</TrimMode>
+    <InvariantGlobalization>false</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>
@@ -12,6 +16,14 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="MultiChatOverlay.Tests" />
+  </ItemGroup>
+
+  <!-- Trimmer root descriptors -->
+  <ItemGroup>
+    <TrimmerRootDescriptor Include="MultiChatOverlay.Core.Models.ChatItem" />
+    <TrimmerRootDescriptor Include="MultiChatOverlay.Core.Models.ChatMessage" />
+    <TrimmerRootDescriptor Include="MultiChatOverlay.Core.Models.ChatEvent" />
+    <TrimmerRootDescriptor Include="MultiChatOverlay.Core.Parsing.TwitchIrcParser" />
   </ItemGroup>
 
 </Project>

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net.Http;
 using MultiChatOverlay.Core.Models;
+using MultiChatOverlay.Core.Services;
 using YTLiveChat.Contracts;
 using YTLiveChat.Contracts.Models;
 using YTLiveChat.Contracts.Services;
@@ -23,16 +24,19 @@ namespace MultiChatOverlay.Core.Sources;
 public sealed class YouTubeInnerTubeChatSource(string target) : IChatSource
 {
     private readonly string _target = ValidateTarget(target);
-    private HttpClient? _httpClient;
     private IYTLiveChat? _chat;
     private bool _stopping;
     private ConnectionState _state = ConnectionState.Disconnected;
+    private ConnectionHealth _health = ConnectionHealth.Unhealthy(DateTimeOffset.MinValue, 0);
+    private bool _hasReceivedMessages; // Used implicitly via side effect in ChatReceived handler
 
     public ChatPlatform Platform => ChatPlatform.YouTube;
     public ConnectionState State => _state;
+    public ConnectionHealth Health => _health;
     public event Action<UnifiedChatItem>? ItemReceived;
     public event Action<ConnectionState>? StateChanged;
     public event Action<Exception>? ErrorOccurred;
+    public event Action<ConnectionHealth>? HealthChanged;
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -41,19 +45,39 @@ public sealed class YouTubeInnerTubeChatSource(string target) : IChatSource
             return Task.CompletedTask;
 
         _stopping = false;
-        _httpClient = new HttpClient { BaseAddress = new Uri("https://www.youtube.com") };
-        _chat = new YtChatService(new YTLiveChatOptions(), new YTHttpClient(_httpClient));
-        _chat.InitialPageLoaded += (_, _) => SetState(ConnectionState.Connected);
+        _hasReceivedMessages = false;
+        var httpClient = HttpClientPool.YouTube;
+        _chat = new YtChatService(new YTLiveChatOptions(), new YTHttpClient(httpClient));
+        _chat.InitialPageLoaded += (_, _) =>
+        {
+            if (!_stopping)
+            {
+                SetState(ConnectionState.Connected);
+                SetHealth(ConnectionHealth.Healthy(DateTimeOffset.UtcNow, TimeSpan.FromMilliseconds(100)));
+            }
+        };
         _chat.ChatReceived += (_, args) =>
         {
             var item = ConvertItem(args.ChatItem);
             if (item is not null)
+            {
+                _hasReceivedMessages = true;
+                // Fallback: if we're receiving messages but InitialPageLoaded didn't fire,
+                // mark as connected
+                if (_state != ConnectionState.Connected && !_stopping)
+                {
+                    SetState(ConnectionState.Connected);
+                    SetHealth(ConnectionHealth.Healthy(DateTimeOffset.UtcNow, TimeSpan.FromMilliseconds(100)));
+                }
                 ItemReceived?.Invoke(item);
+            }
         };
         _chat.ErrorOccurred += (_, args) =>
         {
             ErrorOccurred?.Invoke(args.GetException());
-            SetState(ConnectionState.Reconnecting);
+            SetHealth(_health.RecordFailure());
+            if (!_stopping)
+                SetState(ConnectionState.Reconnecting);
         };
         _chat.ChatStopped += (_, _) =>
         {
@@ -72,6 +96,7 @@ public sealed class YouTubeInnerTubeChatSource(string target) : IChatSource
         catch (Exception ex)
         {
             SetState(ConnectionState.Faulted);
+            SetHealth(_health.RecordFailure());
             ErrorOccurred?.Invoke(ex);
         }
 
@@ -85,13 +110,17 @@ public sealed class YouTubeInnerTubeChatSource(string target) : IChatSource
         _chat?.Stop();
         _chat?.Dispose();
         _chat = null;
-        _httpClient?.Dispose();
-        _httpClient = null;
+        // Don't dispose shared HttpClient
         SetState(ConnectionState.Disconnected);
         return Task.CompletedTask;
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
+
+    public void SetPollInterval(TimeSpan interval)
+    {
+        // YouTube uses library-managed polling - no-op
+    }
 
     private void SetState(ConnectionState state)
     {
@@ -100,6 +129,12 @@ public sealed class YouTubeInnerTubeChatSource(string target) : IChatSource
 
         _state = state;
         StateChanged?.Invoke(state);
+    }
+
+    private void SetHealth(ConnectionHealth health)
+    {
+        _health = health;
+        HealthChanged?.Invoke(health);
     }
 
     private static UnifiedChatItem? ConvertItem(YtChatItem item)
